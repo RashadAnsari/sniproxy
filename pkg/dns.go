@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	rdns "github.com/folbricht/routedns"
 
@@ -31,26 +32,45 @@ var dnsLock sync.RWMutex
 
 // pickSrcAddr picks a random source address from the list of configured source addresses.
 // version specifies the IP version to pick, 4 or 6. If 0, any version is picked.
-func (c *Config) pickSrcAddr(version uint) net.IP {
+func (c *Config) pickSrcAddr(version string) net.IP {
 	if len(c.SourceAddr) == 0 {
 		return nil
 	}
-	if version == 0 {
-		version = uint(rand.Intn(2) + 4)
-	}
-
 	// shuffle the list of source addresses. TODO: potentially a better way to do this
 	for i := range c.SourceAddr {
 		j := rand.Intn(i + 1)
 		c.SourceAddr[i], c.SourceAddr[j] = c.SourceAddr[j], c.SourceAddr[i]
 	}
-
-	for _, ip := range c.SourceAddr {
-		if ip.Is4() && version == 4 {
-			return ip.AsSlice()
+	switch version {
+	case "ipv4only":
+		for _, ip := range c.SourceAddr {
+			if ip.Is4() {
+				return ip.AsSlice()
+			}
 		}
-		if ip.Is6() && version == 6 {
-			return ip.AsSlice()
+	case "ipv6only":
+		for _, ip := range c.SourceAddr {
+			if ip.Is6() {
+				return ip.AsSlice()
+			}
+		}
+	case "ipv4", "4", "0":
+		for _, ip := range c.SourceAddr {
+			if ip.Is4() {
+				return ip.AsSlice()
+			}
+			if ip.Is6() {
+				return ip.AsSlice()
+			}
+		}
+	case "ipv6", "6":
+		for _, ip := range c.SourceAddr {
+			if ip.Is6() {
+				return ip.AsSlice()
+			}
+			if ip.Is4() {
+				return ip.AsSlice()
+			}
 		}
 	}
 	return nil
@@ -71,6 +91,9 @@ func (dnsc *DNSClient) PerformExternalAQuery(fqdn string, QType uint16) ([]dns.R
 	}
 	res, err := dnsc.Resolve(&msg, rdns.ClientInfo{})
 	dnsLock.Unlock()
+	if res == nil {
+		return nil, err
+	}
 	return res.Answer, err
 }
 
@@ -117,16 +140,29 @@ func processQuestion(c *Config, l zerolog.Logger, q dns.Question, decision acl.D
 }
 
 // lookupDomain looks up a domain name and returns the IP address.
-// version specifies the IP version to lookup, 4 or 6. If 0, any version is picked.
-func (dnsc DNSClient) lookupDomain(domain string, version uint) (netip.Addr, error) {
-	if version == 0 {
-		version = uint(rand.Intn(2) + 4)
-	}
-	if version == 4 {
+// version specifies the IP version to lookup, 4 or 6. If 0, any version is picked. currently 0 is ipv4 with ipv6 fallback
+// options are: ipv4 (or 4) and ipv6 (or 6), ipv4only and ipv6only
+func (dnsc DNSClient) lookupDomain(domain string, version string) (netip.Addr, error) {
+
+	switch version {
+	case "ipv4only":
 		return dnsc.lookupDomain4(domain)
-	}
-	if version == 6 {
+	case "ipv6only":
 		return dnsc.lookupDomain6(domain)
+	case "ipv4", "4", "0", "":
+		// try with ipv4, if there's any error, try with ipv6
+		ip, err := dnsc.lookupDomain4(domain)
+		if err != nil {
+			return dnsc.lookupDomain6(domain)
+		}
+		return ip, nil
+	case "ipv6", "6":
+		// try with ipv6, if there's any error, try with ipv4
+		ip, err := dnsc.lookupDomain6(domain)
+		if err != nil {
+			return dnsc.lookupDomain4(domain)
+		}
+		return ip, nil
 	}
 	return netip.IPv4Unspecified(), fmt.Errorf("invalid version")
 }
@@ -151,6 +187,7 @@ func (dnsc DNSClient) lookupDomain4(domain string) (netip.Addr, error) {
 	}
 	return netip.IPv4Unspecified(), fmt.Errorf("[DNS] Unknown type %s", dns.TypeToString[rAddrDNS[0].Header().Rrtype])
 }
+
 func (dnsc DNSClient) lookupDomain6(domain string) (netip.Addr, error) {
 	if !strings.HasSuffix(domain, ".") {
 		domain = domain + "."
@@ -288,12 +325,13 @@ func getDialerFromProxyURL(proxyURL *url.URL) (*rdns.Dialer, error) {
 	dialer = &net.Dialer{}
 	if proxyURL != nil && proxyURL.Host != "" {
 		// create a net dialer with proxy
-		var auth *proxy.Auth
+		auth := new(proxy.Auth)
 		if proxyURL.User != nil {
-			auth = new(proxy.Auth)
 			auth.User = proxyURL.User.Username()
 			if p, ok := proxyURL.User.Password(); ok {
 				auth.Password = p
+			} else {
+				auth.Password = ""
 			}
 		}
 		c, err := socks5.NewClient(proxyURL.Host, auth.User, auth.Password, 0, 5) // 0 and 5 are borrowed from routedns pr
@@ -343,15 +381,16 @@ func NewDNSClient(C *Config, uri string, skipVerify bool, proxy string) (*DNSCli
 
 		var ldarr net.IP
 		if parsedURL.Scheme == "udp6" {
-			ldarr = C.pickSrcAddr(6)
+			ldarr = C.pickSrcAddr("ipv6only")
 		} else {
-			ldarr = C.pickSrcAddr(4)
+			ldarr = C.pickSrcAddr("ipv4only")
 		}
 
 		opt := rdns.DNSClientOptions{
-			LocalAddr: ldarr,
-			UDPSize:   1300,
-			Dialer:    *dialer,
+			LocalAddr:    ldarr,
+			UDPSize:      1300,
+			Dialer:       *dialer,
+			QueryTimeout: 10 * time.Second, //TODO: make this configurable
 		}
 		id, err := rdns.NewDNSClient("id", Address, "udp", opt)
 		if err != nil {
@@ -368,9 +407,9 @@ func NewDNSClient(C *Config, uri string, skipVerify bool, proxy string) (*DNSCli
 
 		var ldarr net.IP
 		if parsedURL.Scheme == "tcp6" {
-			ldarr = C.pickSrcAddr(6)
+			ldarr = C.pickSrcAddr("ipv6only")
 		} else {
-			ldarr = C.pickSrcAddr(4)
+			ldarr = C.pickSrcAddr("ipv4only")
 		}
 
 		Address := rdns.AddressWithDefault(host, port)
@@ -392,10 +431,10 @@ func NewDNSClient(C *Config, uri string, skipVerify bool, proxy string) (*DNSCli
 		var ldarr net.IP
 		bootstrapAddr := "1.1.1.1"
 		if parsedURL.Scheme == "tls6" || parsedURL.Scheme == "tcp-tls6" {
-			ldarr = C.pickSrcAddr(6)
+			ldarr = C.pickSrcAddr("ipv6only")
 			bootstrapAddr = "2606:4700:4700::1111"
 		} else {
-			ldarr = C.pickSrcAddr(4)
+			ldarr = C.pickSrcAddr("ipv4only")
 		}
 
 		opt := rdns.DoTClientOptions{
@@ -421,7 +460,7 @@ func NewDNSClient(C *Config, uri string, skipVerify bool, proxy string) (*DNSCli
 			TLSConfig:     tlsConfig,
 			BootstrapAddr: "1.1.1.1", //TODO: make this configurable
 			Transport:     transport,
-			LocalAddr:     C.pickSrcAddr(4), //TODO:support IPv6
+			LocalAddr:     C.pickSrcAddr("ipv4only"), //TODO:support IPv6
 			Dialer:        *dialer,
 		}
 		id, err := rdns.NewDoHClient("id", parsedURL.String(), opt)
@@ -438,7 +477,7 @@ func NewDNSClient(C *Config, uri string, skipVerify bool, proxy string) (*DNSCli
 
 		opt := rdns.DoQClientOptions{
 			TLSConfig: tlsConfig,
-			LocalAddr: C.pickSrcAddr(4), //TODO:support IPv6
+			LocalAddr: C.pickSrcAddr("ipv4only"), //TODO:support IPv6
 			// Dialer:    *dialer, // BUG: not yet supported
 		}
 		id, err := rdns.NewDoQClient("id", parsedURL.Host, opt)
